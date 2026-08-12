@@ -35,30 +35,27 @@ void main() {
       expect(snap!.segmentIndex, 1); // second segment: (100,0)->(100,100)
     });
 
-    test(
-      'folded, near-parallel segments: click snaps to the segment actually '
-      'nearest to it, not just the globally nearest point',
-      () {
-        // A path that goes out and folds back close and parallel to itself:
-        // segment 0: (0,0) -> (200,0)
-        // segment 1: (200,0) -> (200,10)   (short connector)
-        // segment 2: (200,10) -> (0,10)    (runs back, 10px above segment 0)
-        final path = [
-          const Offset(0, 0),
-          const Offset(200, 0),
-          const Offset(200, 10),
-          const Offset(0, 10),
-        ];
+    test('folded, near-parallel segments: click snaps to the segment actually '
+        'nearest to it, not just the globally nearest point', () {
+      // A path that goes out and folds back close and parallel to itself:
+      // segment 0: (0,0) -> (200,0)
+      // segment 1: (200,0) -> (200,10)   (short connector)
+      // segment 2: (200,10) -> (0,10)    (runs back, 10px above segment 0)
+      final path = [
+        const Offset(0, 0),
+        const Offset(200, 0),
+        const Offset(200, 10),
+        const Offset(0, 10),
+      ];
 
-        // A click much closer to the lower segment (0) than the upper one.
-        final snapLower = snapToNearestSegment(const Offset(50, 2), path);
-        expect(snapLower!.segmentIndex, 0);
+      // A click much closer to the lower segment (0) than the upper one.
+      final snapLower = snapToNearestSegment(const Offset(50, 2), path);
+      expect(snapLower!.segmentIndex, 0);
 
-        // A click much closer to the upper, folded-back segment (2).
-        final snapUpper = snapToNearestSegment(const Offset(50, 8), path);
-        expect(snapUpper!.segmentIndex, 2);
-      },
-    );
+      // A click much closer to the upper, folded-back segment (2).
+      final snapUpper = snapToNearestSegment(const Offset(50, 8), path);
+      expect(snapUpper!.segmentIndex, 2);
+    });
 
     test('returns null for a path with fewer than 2 points', () {
       expect(snapToNearestSegment(Offset.zero, []), isNull);
@@ -99,34 +96,37 @@ void main() {
   group('deriveAddresses', () {
     test('orders bays by arc-length position, not insertion order', () {
       final bays = [
-        const Bay(id: 'bay_2', s: 150),
-        const Bay(id: 'bay_0', s: 10),
-        const Bay(id: 'bay_1', s: 80),
+        const Bay(identifier: 's2', s: 150),
+        const Bay(identifier: 's0', s: 10),
+        const Bay(identifier: 's1', s: 80),
       ];
 
       final addressed = deriveAddresses(bays);
 
-      expect(addressed.map((a) => a.bay.id).toList(), [
-        'bay_0',
-        'bay_1',
-        'bay_2',
+      expect(addressed.map((a) => a.bay.identifier).toList(), [
+        's0',
+        's1',
+        's2',
       ]);
       expect(addressed.map((a) => a.address).toList(), ['s0', 's1', 's2']);
     });
 
     test('re-deriving after a move updates order live', () {
       var bays = [
-        const Bay(id: 'a', s: 10),
-        const Bay(id: 'b', s: 20),
+        const Bay(identifier: 'a', s: 10),
+        const Bay(identifier: 'b', s: 20),
       ];
-      expect(deriveAddresses(bays).map((a) => a.bay.id).toList(), ['a', 'b']);
+      expect(deriveAddresses(bays).map((a) => a.bay.identifier).toList(), [
+        'a',
+        'b',
+      ]);
 
       // Move bay 'a' past bay 'b'.
-      bays = [
-        bays[0].copyWith(s: 30),
-        bays[1],
-      ];
-      expect(deriveAddresses(bays).map((a) => a.bay.id).toList(), ['b', 'a']);
+      bays = [bays[0].copyWith(s: 30), bays[1]];
+      expect(deriveAddresses(bays).map((a) => a.bay.identifier).toList(), [
+        'b',
+        'a',
+      ]);
     });
   });
 }
