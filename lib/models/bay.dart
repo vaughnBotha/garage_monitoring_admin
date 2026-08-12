@@ -62,14 +62,14 @@ class Bay {
       );
     }
     return switch (bayType) {
-      0 => BayPegStyling(fillColor: Color.fromRGBO(132, 248, 31, 1)),
-      1 => BayPegStyling(fillColor: Color.fromRGBO(241, 248, 31, 1)),
-      2 => BayPegStyling(fillColor: Color.fromRGBO(31, 248, 208, 1)),
-      3 => BayPegStyling(fillColor: Color.fromRGBO(31, 234, 248, 1)),
-      4 => BayPegStyling(fillColor: Color.fromRGBO(76, 124, 247, 1)),
-      5 => BayPegStyling(fillColor: Color.fromRGBO(140, 31, 248, 1)),
-      6 => BayPegStyling(fillColor: Color.fromRGBO(248, 31, 237, 1)),
-      7 => BayPegStyling(fillColor: Color.fromRGBO(248, 31, 154, 1)),
+      0 => BayPegStyling(fillColor: Color.fromRGBO(149, 250, 41, 1)),
+      1 => BayPegStyling(fillColor: Color.fromRGBO(248, 172, 31, 1)),
+      2 => BayPegStyling(fillColor: Color.fromRGBO(31, 212, 248, 1)),
+      3 => BayPegStyling(fillColor: Color.fromRGBO(255, 255, 255, 1)),
+      4 => BayPegStyling(fillColor: Color.fromRGBO(177, 54, 248, 1)),
+      5 => BayPegStyling(fillColor: Color.fromRGBO(246, 66, 201, 1)),
+      6 => BayPegStyling(fillColor: Color.fromRGBO(76, 70, 251, 1)),
+      7 => BayPegStyling(fillColor: Color.fromRGBO(241, 248, 31, 1)),
       _ => BayPegStyling(fillColor: Color.fromRGBO(132, 248, 31, 1)),
     };
   }
