@@ -2,6 +2,7 @@ import 'dart:async';
 import 'dart:math' as math;
 import 'dart:ui' as ui;
 
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/gestures.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -94,6 +95,44 @@ class _CanvasScreenState extends State<CanvasScreen> {
   bool _isCycling = false;
   Timer? _cycleTimer;
 
+  // Edit-mode-only entries appended to the bottom of the level dropdown,
+  // below a separator: adding a blank level and attaching/replacing the
+  // selected level's background diagram.
+  static const String _dividerSentinel = '__divider__';
+  static const String _addLevelSentinel = '__add_level__';
+  static const String _addDiagramSentinel = '__add_diagram__';
+
+  void _addLevel() {
+    final newId = 'level-${DateTime.now().microsecondsSinceEpoch}';
+    final newFloor = FloorData(
+      id: newId,
+      name: 'Level ${_floors.length + 1}',
+      zones: [ZoneData(id: '$newId-zone-a', name: 'Zone A')],
+    );
+    _cycleTimer?.cancel();
+    _cycleTimer = null;
+    setState(() {
+      _isCycling = false;
+      _floors.add(newFloor);
+      _selectedFloorId = newFloor.id;
+      _selectedZoneId = newFloor.zones.first.id;
+      _resetTransientInteractionState();
+    });
+  }
+
+  Future<void> _pickDiagram(FloorData floor) async {
+    final result = await FilePicker.pickFiles(
+      type: FileType.image,
+      withData: true,
+    );
+    final bytes = result?.files.single.bytes;
+    if (bytes == null) return;
+    final codec = await ui.instantiateImageCodec(bytes);
+    final frame = await codec.getNextFrame();
+    if (!mounted) return;
+    setState(() => _floorImages[floor.id] = frame.image);
+  }
+
   void _startCycling() {
     _cycleTimer?.cancel();
     setState(() => _isCycling = true);
@@ -132,6 +171,13 @@ class _CanvasScreenState extends State<CanvasScreen> {
   int? _draggingWaypointIndex;
   DateTime? _lastTapTime;
   String? _lastTapBayId;
+
+  // Kept permanently unable to take keyboard focus, on top of the
+  // Space-blocking Shortcuts override in build() -- belt and braces so a
+  // mouse click on a dropdown never leaves it able to react to keyboard
+  // input at all, Space included.
+  final FocusNode _floorDropdownFocusNode = FocusNode(canRequestFocus: false);
+  final FocusNode _zoneDropdownFocusNode = FocusNode(canRequestFocus: false);
 
   // Hand tool: holding Space suspends route/peg clicking and switches the
   // canvas to click-drag panning instead, matching the Figma/Photoshop
@@ -267,6 +313,8 @@ class _CanvasScreenState extends State<CanvasScreen> {
     _cycleTimer?.cancel();
     _hScrollController.dispose();
     _vScrollController.dispose();
+    _floorDropdownFocusNode.dispose();
+    _zoneDropdownFocusNode.dispose();
     super.dispose();
   }
 
@@ -615,116 +663,136 @@ class _CanvasScreenState extends State<CanvasScreen> {
   Widget build(BuildContext context) {
     final floor = _floor;
     final zone = _effectiveZone;
-    return Scaffold(
-      appBar: AppBar(
-        title: const Text('Zone layout — route/peg test'),
-        actions: [
-          // Wrapped in a horizontal scroller: the growing set of toolbar
-          // controls (edit toggle, floor/zone dropdowns, mode toggle,
-          // clear buttons) can exceed the AppBar's width on narrower
-          // windows -- this lets it scroll instead of overflowing.
-          Flexible(
-            child: SingleChildScrollView(
-              scrollDirection: Axis.horizontal,
-              child: Row(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    child: Center(
-                      child: TextButton.icon(
-                        onPressed: () {
-                          final enteringEdit = !_isEditMode;
-                          // Cycling is a View-mode kiosk feature; entering
-                          // Edit stops it and settles on whichever floor
-                          // was showing.
-                          if (enteringEdit) {
-                            _cycleTimer?.cancel();
-                            _cycleTimer = null;
-                          }
-                          setState(() {
-                            _isEditMode = enteringEdit;
-                            if (enteringEdit) _isCycling = false;
-                            _resetTransientInteractionState();
-                          });
-                        },
-                        icon: Icon(
-                          _isEditMode
-                              ? Icons.visibility_outlined
-                              : Icons.edit_outlined,
-                        ),
-                        label: Text(_isEditMode ? 'View' : 'Edit'),
-                      ),
-                    ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(horizontal: 8),
-                    child: Center(
-                      child: DropdownButtonHideUnderline(
-                        child: DropdownButton<String>(
-                          value: _isCycling ? _cycleSentinel : _selectedFloorId,
-                          icon: const Icon(Icons.arrow_drop_down),
-                          items: [
-                            for (final f in _floors)
-                              DropdownMenuItem(
-                                value: f.id,
-                                child: Text(f.name),
-                              ),
-                            // View-mode-only kiosk option -- not shown
-                            // while editing (see the toggle above, which
-                            // also stops cycling on entering Edit).
-                            if (!_isEditMode)
-                              const DropdownMenuItem(
-                                value: _cycleSentinel,
-                                child: Text('Cycle'),
-                              ),
-                          ],
-                          onChanged: (id) {
-                            if (id == null) return;
-                            if (id == _cycleSentinel) {
-                              _startCycling();
-                              return;
+    // Space is reserved app-wide as the canvas pan hotkey. Without this,
+    // Space still reaches whichever widget currently has focus -- e.g. the
+    // level/zone dropdown button (opens it) or, once a dropdown menu is
+    // open, its autofocused selected item (closes it) -- because Flutter's
+    // default Space/Enter-activates-buttons behavior is wired up via
+    // Actions/Shortcuts on the focused widget itself, not through
+    // individual widgets' focusNode settings. Intercepting Space here, above
+    // everything, and mapping it to a no-op stops it from ever reaching
+    // those Shortcuts bindings, while the raw HardwareKeyboard listener in
+    // _handleKeyEvent (a separate, non-widget-tree listener) still sees the
+    // key events fine for pan tracking.
+    return Shortcuts(
+      shortcuts: const <ShortcutActivator, Intent>{
+        SingleActivator(LogicalKeyboardKey.space):
+            DoNothingAndStopPropagationIntent(),
+      },
+      child: Scaffold(
+        appBar: AppBar(
+          title: const Text('Zone layout — route/peg test'),
+          actions: [
+            // Wrapped in a horizontal scroller: the growing set of toolbar
+            // controls (edit toggle, floor/zone dropdowns, mode toggle,
+            // clear buttons) can exceed the AppBar's width on narrower
+            // windows -- this lets it scroll instead of overflowing.
+            Flexible(
+              child: SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                child: Row(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: Center(
+                        child: TextButton.icon(
+                          onPressed: () {
+                            final enteringEdit = !_isEditMode;
+                            // Cycling is a View-mode kiosk feature; entering
+                            // Edit stops it and settles on whichever floor
+                            // was showing.
+                            if (enteringEdit) {
+                              _cycleTimer?.cancel();
+                              _cycleTimer = null;
                             }
-                            if (!_isCycling && id == _selectedFloorId) return;
-                            _cycleTimer?.cancel();
-                            _cycleTimer = null;
-                            final newFloor = _floors.firstWhere(
-                              (f) => f.id == id,
-                            );
                             setState(() {
-                              _isCycling = false;
-                              _selectedFloorId = id;
-                              _selectedZoneId = newFloor.zones.first.id;
+                              _isEditMode = enteringEdit;
+                              if (enteringEdit) _isCycling = false;
                               _resetTransientInteractionState();
                             });
                           },
+                          icon: Icon(
+                            _isEditMode
+                                ? Icons.visibility_outlined
+                                : Icons.edit_outlined,
+                          ),
+                          label: Text(_isEditMode ? 'View' : 'Edit'),
                         ),
                       ),
                     ),
-                  ),
-                  if (_isEditMode) ...[
                     Padding(
                       padding: const EdgeInsets.symmetric(horizontal: 8),
                       child: Center(
                         child: DropdownButtonHideUnderline(
-                          child: DropdownButton<String?>(
-                            value: _selectedZoneId,
+                          child: DropdownButton<String>(
+                            focusNode: _floorDropdownFocusNode,
+                            value: _isCycling
+                                ? _cycleSentinel
+                                : _selectedFloorId,
                             icon: const Icon(Icons.arrow_drop_down),
                             items: [
-                              const DropdownMenuItem<String?>(
-                                value: null,
-                                child: Text('Show all'),
-                              ),
-                              for (final z in floor.zones)
-                                DropdownMenuItem<String?>(
-                                  value: z.id,
-                                  child: Text(z.name),
+                              for (final f in _floors)
+                                DropdownMenuItem(
+                                  value: f.id,
+                                  child: Text(f.name),
                                 ),
+                              // View-mode-only kiosk option -- not shown
+                              // while editing (see the toggle above, which
+                              // also stops cycling on entering Edit).
+                              if (!_isEditMode)
+                                const DropdownMenuItem(
+                                  value: _cycleSentinel,
+                                  child: Text('Cycle'),
+                                ),
+                              // Level-management actions, edit-mode only:
+                              // adding a blank level and attaching/replacing
+                              // the selected level's background diagram.
+                              if (_isEditMode) ...[
+                                const DropdownMenuItem(
+                                  value: _dividerSentinel,
+                                  enabled: false,
+                                  child: Divider(height: 1),
+                                ),
+                                const DropdownMenuItem(
+                                  value: _addLevelSentinel,
+                                  child: Text('Add level'),
+                                ),
+                                DropdownMenuItem(
+                                  value: _addDiagramSentinel,
+                                  child: Text(
+                                    _floorImages[floor.id] != null
+                                        ? 'Update diagram'
+                                        : 'Add diagram',
+                                  ),
+                                ),
+                              ],
                             ],
                             onChanged: (id) {
-                              if (id == _selectedZoneId) return;
+                              if (id == null) return;
+                              if (id == _dividerSentinel) return;
+                              if (id == _cycleSentinel) {
+                                _startCycling();
+                                return;
+                              }
+                              if (id == _addLevelSentinel) {
+                                _addLevel();
+                                return;
+                              }
+                              if (id == _addDiagramSentinel) {
+                                _pickDiagram(floor);
+                                return;
+                              }
+                              if (!_isCycling && id == _selectedFloorId) return;
+                              _cycleTimer?.cancel();
+                              _cycleTimer = null;
+                              final newFloor = _floors.firstWhere(
+                                (f) => f.id == id,
+                              );
                               setState(() {
-                                _selectedZoneId = id;
+                                _isCycling = false;
+                                _selectedFloorId = id;
+                                _selectedZoneId = newFloor.zones.first.id;
                                 _resetTransientInteractionState();
                               });
                             },
@@ -732,180 +800,212 @@ class _CanvasScreenState extends State<CanvasScreen> {
                         ),
                       ),
                     ),
-                    Padding(
-                      padding: const EdgeInsets.symmetric(horizontal: 8),
-                      child: Center(
-                        child: SegmentedButton<CanvasMode>(
-                          segments: const [
-                            ButtonSegment(
-                              value: CanvasMode.route,
-                              label: Text('Route'),
-                              icon: Icon(Icons.timeline),
+                    if (_isEditMode) ...[
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        child: Center(
+                          child: DropdownButtonHideUnderline(
+                            child: DropdownButton<String?>(
+                              focusNode: _zoneDropdownFocusNode,
+                              value: _selectedZoneId,
+                              icon: const Icon(Icons.arrow_drop_down),
+                              items: [
+                                const DropdownMenuItem<String?>(
+                                  value: null,
+                                  child: Text('Show all'),
+                                ),
+                                for (final z in floor.zones)
+                                  DropdownMenuItem<String?>(
+                                    value: z.id,
+                                    child: Text(z.name),
+                                  ),
+                              ],
+                              onChanged: (id) {
+                                if (id == _selectedZoneId) return;
+                                setState(() {
+                                  _selectedZoneId = id;
+                                  _resetTransientInteractionState();
+                                });
+                              },
                             ),
-                            ButtonSegment(
-                              value: CanvasMode.peg,
-                              label: Text('Peg'),
-                              icon: Icon(Icons.push_pin_outlined),
-                            ),
-                          ],
-                          selected: {_mode},
-                          onSelectionChanged: (selection) {
-                            setState(() {
-                              _mode = selection.first;
-                              _resetTransientInteractionState();
-                            });
-                          },
+                          ),
                         ),
                       ),
-                    ),
-                    // A single trash icon, context-sensitive to the
-                    // route/peg mode toggle: in Route mode it clears the
-                    // whole path (and its bays, since they can't exist
-                    // without it); in Peg mode it clears just the bays,
-                    // leaving the route intact.
-                    IconButton(
-                      tooltip: _mode == CanvasMode.route
-                          ? 'Clear path & bays'
-                          : 'Clear bays',
-                      onPressed: zone == null
-                          ? null
-                          : _mode == CanvasMode.route
-                          ? (zone.path.isEmpty
-                                ? null
-                                : () => _confirmAndClearPath(zone))
-                          : (zone.bays.isEmpty
-                                ? null
-                                : () => _confirmAndClearBays(zone)),
-                      icon: const Icon(Icons.delete_outline),
-                    ),
+                      Padding(
+                        padding: const EdgeInsets.symmetric(horizontal: 8),
+                        child: Center(
+                          child: SegmentedButton<CanvasMode>(
+                            segments: const [
+                              ButtonSegment(
+                                value: CanvasMode.route,
+                                label: Text('Route'),
+                                icon: Icon(Icons.timeline),
+                              ),
+                              ButtonSegment(
+                                value: CanvasMode.peg,
+                                label: Text('Peg'),
+                                icon: Icon(Icons.push_pin_outlined),
+                              ),
+                            ],
+                            selected: {_mode},
+                            onSelectionChanged: (selection) {
+                              setState(() {
+                                _mode = selection.first;
+                                _resetTransientInteractionState();
+                              });
+                            },
+                          ),
+                        ),
+                      ),
+                      // A single trash icon, context-sensitive to the
+                      // route/peg mode toggle: in Route mode it clears the
+                      // whole path (and its bays, since they can't exist
+                      // without it); in Peg mode it clears just the bays,
+                      // leaving the route intact.
+                      IconButton(
+                        tooltip: _mode == CanvasMode.route
+                            ? 'Clear path & bays'
+                            : 'Clear bays',
+                        onPressed: zone == null
+                            ? null
+                            : _mode == CanvasMode.route
+                            ? (zone.path.isEmpty
+                                  ? null
+                                  : () => _confirmAndClearPath(zone))
+                            : (zone.bays.isEmpty
+                                  ? null
+                                  : () => _confirmAndClearBays(zone)),
+                        icon: const Icon(Icons.delete_outline),
+                      ),
+                    ],
+                    const SizedBox(width: 8),
                   ],
-                  const SizedBox(width: 8),
-                ],
+                ),
               ),
             ),
-          ),
-        ],
-      ),
-      body: Column(
-        children: [
-          // Hidden entirely in View mode -- along with reclaiming the
-          // vertical space for the canvas, there's nothing edit-specific
-          // (mode hints, zoom controls) left to show once editing is off.
-          if (_isEditMode)
-            _InstructionsBar(
-              mode: _mode,
-              readOnly: zone == null,
-              zoom: _zoom,
-              minZoom: _minZoom,
-              maxZoom: _maxZoom,
-              onZoomIn: _zoomIn,
-              onZoomOut: _zoomOut,
-              onZoomReset: _resetZoom,
-            ),
-          Expanded(
-            child: _isEditMode
-                // Edit mode: fixed-size canvas at the current zoom level,
-                // panned around inside scroll views.
-                ? Listener(
-                    // Wraps (is an ancestor of) the scroll views below, so
-                    // it's dispatched to *after* they've already claimed
-                    // the pointer signal for panning -- registering here
-                    // when the zoom modifier is held overrides that claim
-                    // for this event only.
-                    onPointerSignal: _handleViewportPointerSignal,
-                    child: LayoutBuilder(
-                      builder: (context, constraints) {
-                        // Captured for _fitScale/_effectiveZoom, which the
-                        // zoom-anchor math and pointer handlers also read
-                        // outside of this build -- see their definitions.
-                        _viewportSize = constraints.biggest;
+          ],
+        ),
+        body: Column(
+          children: [
+            // Hidden entirely in View mode -- along with reclaiming the
+            // vertical space for the canvas, there's nothing edit-specific
+            // (mode hints, zoom controls) left to show once editing is off.
+            if (_isEditMode)
+              _InstructionsBar(
+                mode: _mode,
+                readOnly: zone == null,
+                zoom: _zoom,
+                minZoom: _minZoom,
+                maxZoom: _maxZoom,
+                onZoomIn: _zoomIn,
+                onZoomOut: _zoomOut,
+                onZoomReset: _resetZoom,
+              ),
+            Expanded(
+              child: _isEditMode
+                  // Edit mode: fixed-size canvas at the current zoom level,
+                  // panned around inside scroll views.
+                  ? Listener(
+                      // Wraps (is an ancestor of) the scroll views below, so
+                      // it's dispatched to *after* they've already claimed
+                      // the pointer signal for panning -- registering here
+                      // when the zoom modifier is held overrides that claim
+                      // for this event only.
+                      onPointerSignal: _handleViewportPointerSignal,
+                      child: LayoutBuilder(
+                        builder: (context, constraints) {
+                          // Captured for _fitScale/_effectiveZoom, which the
+                          // zoom-anchor math and pointer handlers also read
+                          // outside of this build -- see their definitions.
+                          _viewportSize = constraints.biggest;
 
-                        // A bare Center around a scroll view is a no-op --
-                        // SingleChildScrollView always claims the full
-                        // available space itself, so a canvas smaller than
-                        // the viewport would otherwise sit at the
-                        // scroll-origin corner instead of being centered.
-                        // Forcing the scrollable content to be at least as
-                        // big as the viewport (via these min constraints)
-                        // gives the inner Center real slack to center
-                        // within once the canvas is smaller than that --
-                        // and still scrolls normally once it's bigger.
-                        return SingleChildScrollView(
-                          controller: _hScrollController,
-                          scrollDirection: Axis.horizontal,
-                          child: SingleChildScrollView(
-                            controller: _vScrollController,
-                            child: ConstrainedBox(
-                              constraints: BoxConstraints(
-                                minWidth: constraints.maxWidth,
-                                minHeight: constraints.maxHeight,
-                              ),
-                              child: Center(
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    border: Border.all(
-                                      color: const Color(0xFFB8AF9A),
-                                    ),
-                                    boxShadow: const [
-                                      BoxShadow(
-                                        color: Colors.black26,
-                                        blurRadius: 8,
-                                        offset: Offset(0, 2),
+                          // A bare Center around a scroll view is a no-op --
+                          // SingleChildScrollView always claims the full
+                          // available space itself, so a canvas smaller than
+                          // the viewport would otherwise sit at the
+                          // scroll-origin corner instead of being centered.
+                          // Forcing the scrollable content to be at least as
+                          // big as the viewport (via these min constraints)
+                          // gives the inner Center real slack to center
+                          // within once the canvas is smaller than that --
+                          // and still scrolls normally once it's bigger.
+                          return SingleChildScrollView(
+                            controller: _hScrollController,
+                            scrollDirection: Axis.horizontal,
+                            child: SingleChildScrollView(
+                              controller: _vScrollController,
+                              child: ConstrainedBox(
+                                constraints: BoxConstraints(
+                                  minWidth: constraints.maxWidth,
+                                  minHeight: constraints.maxHeight,
+                                ),
+                                child: Center(
+                                  child: Container(
+                                    decoration: BoxDecoration(
+                                      border: Border.all(
+                                        color: const Color(0xFFB8AF9A),
                                       ),
-                                    ],
-                                  ),
-                                  // The canvas widget is laid out at
-                                  // logical size * _effectiveZoom (fit-to-
-                                  // window baseline times the user's zoom
-                                  // multiplier) so it maximizes the
-                                  // available space by default and the
-                                  // scroll views can pan around it once
-                                  // zoomed in further; PathPainter applies
-                                  // the matching scale internally so
-                                  // background/path/bays stay in lockstep.
-                                  width: _canvasSize.width * _effectiveZoom,
-                                  height: _canvasSize.height * _effectiveZoom,
-                                  child: _buildCanvasCore(
-                                    floor,
-                                    zone,
-                                    _effectiveZoom,
+                                      boxShadow: const [
+                                        BoxShadow(
+                                          color: Colors.black26,
+                                          blurRadius: 8,
+                                          offset: Offset(0, 2),
+                                        ),
+                                      ],
+                                    ),
+                                    // The canvas widget is laid out at
+                                    // logical size * _effectiveZoom (fit-to-
+                                    // window baseline times the user's zoom
+                                    // multiplier) so it maximizes the
+                                    // available space by default and the
+                                    // scroll views can pan around it once
+                                    // zoomed in further; PathPainter applies
+                                    // the matching scale internally so
+                                    // background/path/bays stay in lockstep.
+                                    width: _canvasSize.width * _effectiveZoom,
+                                    height: _canvasSize.height * _effectiveZoom,
+                                    child: _buildCanvasCore(
+                                      floor,
+                                      zone,
+                                      _effectiveZoom,
+                                    ),
                                   ),
                                 ),
                               ),
                             ),
-                          ),
-                        );
-                      },
-                    ),
-                  )
-                // View mode: no zoom/pan state to manage, so scale the
-                // drawing up to fill as much of the available space as
-                // possible without distorting it, centered within
-                // whatever's left over. SizedBox.expand is required here,
-                // not Center -- Center hands FittedBox loose constraints,
-                // so it would just size to its child's native 1100x720
-                // and never actually grow to fill the viewport.
-                : SizedBox.expand(
-                    child: FittedBox(
-                      fit: BoxFit.contain,
-                      child: SizedBox(
-                        width: _canvasSize.width,
-                        height: _canvasSize.height,
-                        child: _buildCanvasCore(floor, zone, 1.0),
+                          );
+                        },
+                      ),
+                    )
+                  // View mode: no zoom/pan state to manage, so scale the
+                  // drawing up to fill as much of the available space as
+                  // possible without distorting it, centered within
+                  // whatever's left over. SizedBox.expand is required here,
+                  // not Center -- Center hands FittedBox loose constraints,
+                  // so it would just size to its child's native 1100x720
+                  // and never actually grow to fill the viewport.
+                  : SizedBox.expand(
+                      child: FittedBox(
+                        fit: BoxFit.contain,
+                        child: SizedBox(
+                          width: _canvasSize.width,
+                          height: _canvasSize.height,
+                          child: _buildCanvasCore(floor, zone, 1.0),
+                        ),
                       ),
                     ),
-                  ),
-          ),
-          // Hidden entirely in View mode -- it's edit-scoped bookkeeping
-          // (waypoint/bay counts, sensor-pegging progress) that has
-          // nothing to show once editing is off.
-          if (_isEditMode)
-            _StatusBar(
-              floorName: floor.name,
-              zone: zone,
-              zoneCount: floor.zones.length,
             ),
-        ],
+            // Hidden entirely in View mode -- it's edit-scoped bookkeeping
+            // (waypoint/bay counts, sensor-pegging progress) that has
+            // nothing to show once editing is off.
+            if (_isEditMode)
+              _StatusBar(
+                floorName: floor.name,
+                zone: zone,
+                zoneCount: floor.zones.length,
+              ),
+          ],
+        ),
       ),
     );
   }
