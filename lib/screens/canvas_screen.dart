@@ -1,3 +1,5 @@
+import 'dart:async';
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 
 import 'package:flutter/gestures.dart';
@@ -40,6 +42,14 @@ class CanvasScreen extends StatefulWidget {
 class _CanvasScreenState extends State<CanvasScreen> {
   CanvasMode _mode = CanvasMode.route;
 
+  // App-wide View/Edit toggle. In View mode only the floor dropdown is
+  // shown -- zone selection, the route/peg mode toggle, clear buttons, and
+  // zoom controls all disappear, and the canvas becomes a read-only
+  // floor-wide overview (same rendering as picking "Show all", just
+  // without a zone dropdown to pick it from). Edit mode restores
+  // whichever zone was last selected.
+  bool _isEditMode = false;
+
   // Mock in-memory ParkingLevel list for this build -- no server. Each
   // floor holds its own zones, and each zone keeps its own independent
   // path/bays; switching floors or zones just changes which one the
@@ -74,6 +84,32 @@ class _CanvasScreenState extends State<CanvasScreen> {
   /// read-only overview of every zone on the floor at once.
   late String? _selectedZoneId = _floors.first.zones.first.id;
 
+  // "Cycle" is a View-mode-only kiosk feature: auto-advance through every
+  // floor, 30s each, looping. It's a level-dropdown option rather than a
+  // separate control since it's really just an alternate way of driving
+  // _selectedFloorId. Picking a specific floor (or leaving View mode)
+  // stops it.
+  static const String _cycleSentinel = '__cycle__';
+  static const Duration _cycleInterval = Duration(seconds: 30);
+  bool _isCycling = false;
+  Timer? _cycleTimer;
+
+  void _startCycling() {
+    _cycleTimer?.cancel();
+    setState(() => _isCycling = true);
+    _cycleTimer = Timer.periodic(_cycleInterval, (_) => _advanceCycle());
+  }
+
+  void _advanceCycle() {
+    final currentIndex = _floors.indexWhere((f) => f.id == _selectedFloorId);
+    final nextFloor = _floors[(currentIndex + 1) % _floors.length];
+    setState(() {
+      _selectedFloorId = nextFloor.id;
+      _selectedZoneId = nextFloor.zones.first.id;
+      _resetTransientInteractionState();
+    });
+  }
+
   FloorData get _floor => _floors.firstWhere((f) => f.id == _selectedFloorId);
 
   ZoneData? get _zone {
@@ -81,6 +117,11 @@ class _CanvasScreenState extends State<CanvasScreen> {
     if (id == null) return null;
     return _floor.zones.firstWhere((z) => z.id == id);
   }
+
+  /// The zone actually used for editing/rendering: [_zone] gated by View
+  /// mode. Keeping [_selectedZoneId] untouched while in View mode means
+  /// switching back to Edit restores whatever zone was picked before.
+  ZoneData? get _effectiveZone => _isEditMode ? _zone : null;
 
   // Floor plan images are decoded once per floor and cached here, keyed by
   // floor id. Loading is fire-and-forget from initState; until an entry
@@ -103,7 +144,32 @@ class _CanvasScreenState extends State<CanvasScreen> {
   static const double _maxZoom = 3.0;
   static const double _zoomStep = 0.25;
   static const double _wheelZoomSensitivity = 0.0018;
+
+  /// User-facing zoom multiplier: 1.0 means "fit to window" (see
+  /// [_fitScale]), not literal 1:1 pixels -- so 100% already maximizes the
+  /// canvas within the available space, matching View mode's philosophy,
+  /// while still leaving room to zoom in/out and pan from there.
   double _zoom = 1.0;
+
+  /// Size of the Edit-mode canvas viewport, captured from the LayoutBuilder
+  /// in build() each frame so [_fitScale] and the pointer handlers can use
+  /// it outside of the widget tree.
+  Size _viewportSize = Size.zero;
+
+  /// Uniform scale that fits the fixed logical canvas ([_canvasSize])
+  /// entirely within [_viewportSize] without distorting it (like
+  /// BoxFit.contain) -- the baseline that [_zoom] multiplies from.
+  double get _fitScale {
+    if (_viewportSize.isEmpty) return 1.0;
+    return math.min(
+      _viewportSize.width / _canvasSize.width,
+      _viewportSize.height / _canvasSize.height,
+    );
+  }
+
+  /// The actual render/hit-test scale: fit-to-window baseline times the
+  /// user's zoom multiplier.
+  double get _effectiveZoom => _fitScale * _zoom;
 
   final ScrollController _hScrollController = ScrollController();
   final ScrollController _vScrollController = ScrollController();
@@ -119,6 +185,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
       HardwareKeyboard.instance.isMetaPressed;
 
   void _handleViewportPointerSignal(PointerSignalEvent event) {
+    if (!_isEditMode) return; // View mode auto-fits; there's nothing to zoom
     if (event is! PointerScrollEvent) return;
     if (!_zoomModifierPressed) return; // let the scroll views pan normally
 
@@ -146,6 +213,13 @@ class _CanvasScreenState extends State<CanvasScreen> {
       return;
     }
 
+    // The fit-to-window baseline (_fitScale) doesn't change mid-gesture,
+    // only _zoom does -- so scale old/new by it consistently and the
+    // anchor math below works the same as it would for a plain 1:1 zoom.
+    final fitScale = _fitScale;
+    final oldEffectiveZoom = fitScale * oldZoom;
+    final newEffectiveZoom = fitScale * newZoom;
+
     final hOffset = _hScrollController.hasClients
         ? _hScrollController.offset
         : 0.0;
@@ -156,9 +230,11 @@ class _CanvasScreenState extends State<CanvasScreen> {
       viewportPosition.dx + hOffset,
       viewportPosition.dy + vOffset,
     );
-    final logicalPoint = canvasPoint / oldZoom;
-    final newHOffset = hOffset + logicalPoint.dx * (newZoom - oldZoom);
-    final newVOffset = vOffset + logicalPoint.dy * (newZoom - oldZoom);
+    final logicalPoint = canvasPoint / oldEffectiveZoom;
+    final newHOffset =
+        hOffset + logicalPoint.dx * (newEffectiveZoom - oldEffectiveZoom);
+    final newVOffset =
+        vOffset + logicalPoint.dy * (newEffectiveZoom - oldEffectiveZoom);
 
     setState(() => _zoom = newZoom);
 
@@ -188,6 +264,7 @@ class _CanvasScreenState extends State<CanvasScreen> {
   @override
   void dispose() {
     HardwareKeyboard.instance.removeHandler(_handleKeyEvent);
+    _cycleTimer?.cancel();
     _hScrollController.dispose();
     _vScrollController.dispose();
     super.dispose();
@@ -218,13 +295,14 @@ class _CanvasScreenState extends State<CanvasScreen> {
       return;
     }
 
-    final zone = _zone;
-    if (zone == null) return; // "Show all" is a read-only overview
+    final zone = _effectiveZone;
+    if (zone == null) return; // "Show all" / View mode is a read-only overview
 
-    // The canvas is rendered at logicalSize * _zoom pixels (see build()),
-    // so pointer positions arrive in zoomed screen space -- divide back
-    // down to logical coordinates before doing any hit-testing/geometry.
-    final position = event.localPosition / _zoom;
+    // The canvas is rendered at logicalSize * _effectiveZoom pixels (see
+    // build()), so pointer positions arrive in that scaled screen space --
+    // divide back down to logical coordinates before doing any
+    // hit-testing/geometry.
+    final position = event.localPosition / _effectiveZoom;
     final isSecondary = event.buttons & kSecondaryMouseButton != 0;
 
     if (_mode == CanvasMode.route) {
@@ -299,9 +377,9 @@ class _CanvasScreenState extends State<CanvasScreen> {
       return;
     }
 
-    final zone = _zone;
+    final zone = _effectiveZone;
     if (zone == null) return;
-    final position = event.localPosition / _zoom;
+    final position = event.localPosition / _effectiveZoom;
 
     if (_mode == CanvasMode.route && _draggingWaypointIndex != null) {
       setState(() => zone.path[_draggingWaypointIndex!] = position);
@@ -421,6 +499,43 @@ class _CanvasScreenState extends State<CanvasScreen> {
     setState(() => zone.path.removeAt(index));
   }
 
+  Future<bool> _confirmClear(String message) async {
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        title: const Text('Clear confirmation'),
+        content: Text(message),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.of(context).pop(false),
+            child: const Text('Cancel'),
+          ),
+          FilledButton(
+            onPressed: () => Navigator.of(context).pop(true),
+            child: const Text('Clear'),
+          ),
+        ],
+      ),
+    );
+    return confirmed ?? false;
+  }
+
+  Future<void> _confirmAndClearPath(ZoneData zone) async {
+    final confirmed = await _confirmClear(
+      'Are you sure you want to clear the path and bays for ${zone.name}? '
+      'This can\'t be undone.',
+    );
+    if (confirmed) _clearPath(zone);
+  }
+
+  Future<void> _confirmAndClearBays(ZoneData zone) async {
+    final confirmed = await _confirmClear(
+      'Are you sure you want to clear the bays for ${zone.name}? '
+      'This can\'t be undone.',
+    );
+    if (confirmed) _clearBays(zone);
+  }
+
   void _clearPath(ZoneData zone) {
     setState(() {
       zone.path.clear();
@@ -445,219 +560,351 @@ class _CanvasScreenState extends State<CanvasScreen> {
     _lastTapTime = null;
   }
 
+  List<BayLayer> _bayLayersFor(FloorData floor, ZoneData? zone) {
+    if (zone == null) {
+      return [
+        for (final z in floor.zones)
+          BayLayer(path: z.path, bays: z.bays, muted: false),
+      ];
+    }
+    return [
+      BayLayer(path: zone.path, bays: zone.bays, muted: false),
+      for (final z in floor.zones)
+        if (z.id != zone.id) BayLayer(path: z.path, bays: z.bays, muted: true),
+    ];
+  }
+
+  List<List<Offset>> _otherPathsFor(FloorData floor, ZoneData? zone) {
+    if (zone == null) return [for (final z in floor.zones) z.path];
+    return [
+      for (final z in floor.zones)
+        if (z.id != zone.id) z.path,
+    ];
+  }
+
+  /// The interactive canvas core (cursor + gesture handling + painting),
+  /// shared between Edit mode's pannable/zoomable box and View mode's
+  /// fit-to-viewport box below -- only [zoom] differs between the two.
+  Widget _buildCanvasCore(FloorData floor, ZoneData? zone, double zoom) {
+    return MouseRegion(
+      cursor: _spaceHeld
+          ? (_isPanning ? SystemMouseCursors.grabbing : SystemMouseCursors.grab)
+          : MouseCursor.defer,
+      child: Listener(
+        onPointerDown: _handlePointerDown,
+        onPointerMove: _handlePointerMove,
+        onPointerUp: _handlePointerUp,
+        child: CustomPaint(
+          size: Size(_canvasSize.width * zoom, _canvasSize.height * zoom),
+          painter: PathPainter(
+            path: zone?.path ?? const [],
+            bayLayers: _bayLayersFor(floor, zone),
+            otherPaths: _otherPathsFor(floor, zone),
+            logicalSize: _canvasSize,
+            zoom: zoom,
+            draggingBayId: _draggingBayId,
+            draggingWaypointIndex: _draggingWaypointIndex,
+            floorPlanImage: _floorImages[floor.id],
+          ),
+        ),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final floor = _floor;
-    final zone = _zone;
+    final zone = _effectiveZone;
     return Scaffold(
       appBar: AppBar(
         title: const Text('Zone layout — route/peg test'),
         actions: [
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            child: Center(
-              child: DropdownButtonHideUnderline(
-                child: DropdownButton<String>(
-                  value: _selectedFloorId,
-                  icon: const Icon(Icons.arrow_drop_down),
-                  items: [
-                    for (final f in _floors)
-                      DropdownMenuItem(value: f.id, child: Text(f.name)),
-                  ],
-                  onChanged: (id) {
-                    if (id == null || id == _selectedFloorId) return;
-                    final newFloor = _floors.firstWhere((f) => f.id == id);
-                    setState(() {
-                      _selectedFloorId = id;
-                      _selectedZoneId = newFloor.zones.first.id;
-                      _resetTransientInteractionState();
-                    });
-                  },
-                ),
-              ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            child: Center(
-              child: DropdownButtonHideUnderline(
-                child: DropdownButton<String?>(
-                  value: _selectedZoneId,
-                  icon: const Icon(Icons.arrow_drop_down),
-                  items: [
-                    const DropdownMenuItem<String?>(
-                      value: null,
-                      child: Text('Show all'),
+          // Wrapped in a horizontal scroller: the growing set of toolbar
+          // controls (edit toggle, floor/zone dropdowns, mode toggle,
+          // clear buttons) can exceed the AppBar's width on narrower
+          // windows -- this lets it scroll instead of overflowing.
+          Flexible(
+            child: SingleChildScrollView(
+              scrollDirection: Axis.horizontal,
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: Center(
+                      child: TextButton.icon(
+                        onPressed: () {
+                          final enteringEdit = !_isEditMode;
+                          // Cycling is a View-mode kiosk feature; entering
+                          // Edit stops it and settles on whichever floor
+                          // was showing.
+                          if (enteringEdit) {
+                            _cycleTimer?.cancel();
+                            _cycleTimer = null;
+                          }
+                          setState(() {
+                            _isEditMode = enteringEdit;
+                            if (enteringEdit) _isCycling = false;
+                            _resetTransientInteractionState();
+                          });
+                        },
+                        icon: Icon(
+                          _isEditMode
+                              ? Icons.visibility_outlined
+                              : Icons.edit_outlined,
+                        ),
+                        label: Text(_isEditMode ? 'View' : 'Edit'),
+                      ),
                     ),
-                    for (final z in floor.zones)
-                      DropdownMenuItem<String?>(
-                        value: z.id,
-                        child: Text(z.name),
-                      ),
-                  ],
-                  onChanged: (id) {
-                    if (id == _selectedZoneId) return;
-                    setState(() {
-                      _selectedZoneId = id;
-                      _resetTransientInteractionState();
-                    });
-                  },
-                ),
-              ),
-            ),
-          ),
-          Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 8),
-            child: Center(
-              child: SegmentedButton<CanvasMode>(
-                segments: const [
-                  ButtonSegment(
-                    value: CanvasMode.route,
-                    label: Text('Route'),
-                    icon: Icon(Icons.timeline),
                   ),
-                  ButtonSegment(
-                    value: CanvasMode.peg,
-                    label: Text('Peg'),
-                    icon: Icon(Icons.push_pin_outlined),
-                  ),
-                ],
-                selected: {_mode},
-                onSelectionChanged: (selection) {
-                  setState(() {
-                    _mode = selection.first;
-                    _resetTransientInteractionState();
-                  });
-                },
-              ),
-            ),
-          ),
-          IconButton(
-            tooltip: 'Clear bays',
-            onPressed: (zone == null || zone.bays.isEmpty)
-                ? null
-                : () => _clearBays(zone),
-            icon: const Icon(Icons.push_pin),
-          ),
-          IconButton(
-            tooltip: 'Clear path & bays',
-            onPressed: (zone == null || zone.path.isEmpty)
-                ? null
-                : () => _clearPath(zone),
-            icon: const Icon(Icons.delete_outline),
-          ),
-          const SizedBox(width: 8),
-        ],
-      ),
-      body: Column(
-        children: [
-          _InstructionsBar(
-            mode: _mode,
-            readOnly: zone == null,
-            zoom: _zoom,
-            minZoom: _minZoom,
-            maxZoom: _maxZoom,
-            onZoomIn: _zoomIn,
-            onZoomOut: _zoomOut,
-            onZoomReset: _resetZoom,
-          ),
-          Expanded(
-            child: Listener(
-              // Wraps (is an ancestor of) the scroll views below, so it's
-              // dispatched to *after* they've already claimed the pointer
-              // signal for panning -- registering here when the zoom
-              // modifier is held overrides that claim for this event only.
-              onPointerSignal: _handleViewportPointerSignal,
-              child: Center(
-                child: SingleChildScrollView(
-                  controller: _hScrollController,
-                  scrollDirection: Axis.horizontal,
-                  child: SingleChildScrollView(
-                    controller: _vScrollController,
-                    child: Container(
-                      decoration: BoxDecoration(
-                        border: Border.all(color: const Color(0xFFB8AF9A)),
-                        boxShadow: const [
-                          BoxShadow(
-                            color: Colors.black26,
-                            blurRadius: 8,
-                            offset: Offset(0, 2),
-                          ),
-                        ],
-                      ),
-                      // The canvas widget is laid out at logical size *
-                      // zoom so the scroll views can pan around it once
-                      // zoomed in; PathPainter applies the matching scale
-                      // internally so background/path/bays stay in
-                      // lockstep.
-                      width: _canvasSize.width * _zoom,
-                      height: _canvasSize.height * _zoom,
-                      child: MouseRegion(
-                        cursor: _spaceHeld
-                            ? (_isPanning
-                                  ? SystemMouseCursors.grabbing
-                                  : SystemMouseCursors.grab)
-                            : MouseCursor.defer,
-                        child: Listener(
-                          onPointerDown: _handlePointerDown,
-                          onPointerMove: _handlePointerMove,
-                          onPointerUp: _handlePointerUp,
-                          child: CustomPaint(
-                            size: Size(
-                              _canvasSize.width * _zoom,
-                              _canvasSize.height * _zoom,
-                            ),
-                            painter: PathPainter(
-                              path: zone?.path ?? const [],
-                              bayLayers: zone == null
-                                  ? [
-                                      for (final z in floor.zones)
-                                        BayLayer(
-                                          path: z.path,
-                                          bays: z.bays,
-                                          muted: false,
-                                        ),
-                                    ]
-                                  : [
-                                      BayLayer(
-                                        path: zone.path,
-                                        bays: zone.bays,
-                                        muted: false,
-                                      ),
-                                      for (final z in floor.zones)
-                                        if (z.id != zone.id)
-                                          BayLayer(
-                                            path: z.path,
-                                            bays: z.bays,
-                                            muted: true,
-                                          ),
-                                    ],
-                              otherPaths: zone == null
-                                  ? [for (final z in floor.zones) z.path]
-                                  : [
-                                      for (final z in floor.zones)
-                                        if (z.id != zone.id) z.path,
-                                    ],
-                              logicalSize: _canvasSize,
-                              zoom: _zoom,
-                              draggingBayId: _draggingBayId,
-                              draggingWaypointIndex: _draggingWaypointIndex,
-                              floorPlanImage: _floorImages[floor.id],
-                            ),
-                          ),
+                  Padding(
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    child: Center(
+                      child: DropdownButtonHideUnderline(
+                        child: DropdownButton<String>(
+                          value: _isCycling ? _cycleSentinel : _selectedFloorId,
+                          icon: const Icon(Icons.arrow_drop_down),
+                          items: [
+                            for (final f in _floors)
+                              DropdownMenuItem(
+                                value: f.id,
+                                child: Text(f.name),
+                              ),
+                            // View-mode-only kiosk option -- not shown
+                            // while editing (see the toggle above, which
+                            // also stops cycling on entering Edit).
+                            if (!_isEditMode)
+                              const DropdownMenuItem(
+                                value: _cycleSentinel,
+                                child: Text('Cycle'),
+                              ),
+                          ],
+                          onChanged: (id) {
+                            if (id == null) return;
+                            if (id == _cycleSentinel) {
+                              _startCycling();
+                              return;
+                            }
+                            if (!_isCycling && id == _selectedFloorId) return;
+                            _cycleTimer?.cancel();
+                            _cycleTimer = null;
+                            final newFloor = _floors.firstWhere(
+                              (f) => f.id == id,
+                            );
+                            setState(() {
+                              _isCycling = false;
+                              _selectedFloorId = id;
+                              _selectedZoneId = newFloor.zones.first.id;
+                              _resetTransientInteractionState();
+                            });
+                          },
                         ),
                       ),
                     ),
                   ),
-                ),
+                  if (_isEditMode) ...[
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: Center(
+                        child: DropdownButtonHideUnderline(
+                          child: DropdownButton<String?>(
+                            value: _selectedZoneId,
+                            icon: const Icon(Icons.arrow_drop_down),
+                            items: [
+                              const DropdownMenuItem<String?>(
+                                value: null,
+                                child: Text('Show all'),
+                              ),
+                              for (final z in floor.zones)
+                                DropdownMenuItem<String?>(
+                                  value: z.id,
+                                  child: Text(z.name),
+                                ),
+                            ],
+                            onChanged: (id) {
+                              if (id == _selectedZoneId) return;
+                              setState(() {
+                                _selectedZoneId = id;
+                                _resetTransientInteractionState();
+                              });
+                            },
+                          ),
+                        ),
+                      ),
+                    ),
+                    Padding(
+                      padding: const EdgeInsets.symmetric(horizontal: 8),
+                      child: Center(
+                        child: SegmentedButton<CanvasMode>(
+                          segments: const [
+                            ButtonSegment(
+                              value: CanvasMode.route,
+                              label: Text('Route'),
+                              icon: Icon(Icons.timeline),
+                            ),
+                            ButtonSegment(
+                              value: CanvasMode.peg,
+                              label: Text('Peg'),
+                              icon: Icon(Icons.push_pin_outlined),
+                            ),
+                          ],
+                          selected: {_mode},
+                          onSelectionChanged: (selection) {
+                            setState(() {
+                              _mode = selection.first;
+                              _resetTransientInteractionState();
+                            });
+                          },
+                        ),
+                      ),
+                    ),
+                    // A single trash icon, context-sensitive to the
+                    // route/peg mode toggle: in Route mode it clears the
+                    // whole path (and its bays, since they can't exist
+                    // without it); in Peg mode it clears just the bays,
+                    // leaving the route intact.
+                    IconButton(
+                      tooltip: _mode == CanvasMode.route
+                          ? 'Clear path & bays'
+                          : 'Clear bays',
+                      onPressed: zone == null
+                          ? null
+                          : _mode == CanvasMode.route
+                          ? (zone.path.isEmpty
+                                ? null
+                                : () => _confirmAndClearPath(zone))
+                          : (zone.bays.isEmpty
+                                ? null
+                                : () => _confirmAndClearBays(zone)),
+                      icon: const Icon(Icons.delete_outline),
+                    ),
+                  ],
+                  const SizedBox(width: 8),
+                ],
               ),
             ),
           ),
-          _StatusBar(
-            floorName: floor.name,
-            zone: zone,
-            zoneCount: floor.zones.length,
+        ],
+      ),
+      body: Column(
+        children: [
+          // Hidden entirely in View mode -- along with reclaiming the
+          // vertical space for the canvas, there's nothing edit-specific
+          // (mode hints, zoom controls) left to show once editing is off.
+          if (_isEditMode)
+            _InstructionsBar(
+              mode: _mode,
+              readOnly: zone == null,
+              zoom: _zoom,
+              minZoom: _minZoom,
+              maxZoom: _maxZoom,
+              onZoomIn: _zoomIn,
+              onZoomOut: _zoomOut,
+              onZoomReset: _resetZoom,
+            ),
+          Expanded(
+            child: _isEditMode
+                // Edit mode: fixed-size canvas at the current zoom level,
+                // panned around inside scroll views.
+                ? Listener(
+                    // Wraps (is an ancestor of) the scroll views below, so
+                    // it's dispatched to *after* they've already claimed
+                    // the pointer signal for panning -- registering here
+                    // when the zoom modifier is held overrides that claim
+                    // for this event only.
+                    onPointerSignal: _handleViewportPointerSignal,
+                    child: LayoutBuilder(
+                      builder: (context, constraints) {
+                        // Captured for _fitScale/_effectiveZoom, which the
+                        // zoom-anchor math and pointer handlers also read
+                        // outside of this build -- see their definitions.
+                        _viewportSize = constraints.biggest;
+
+                        // A bare Center around a scroll view is a no-op --
+                        // SingleChildScrollView always claims the full
+                        // available space itself, so a canvas smaller than
+                        // the viewport would otherwise sit at the
+                        // scroll-origin corner instead of being centered.
+                        // Forcing the scrollable content to be at least as
+                        // big as the viewport (via these min constraints)
+                        // gives the inner Center real slack to center
+                        // within once the canvas is smaller than that --
+                        // and still scrolls normally once it's bigger.
+                        return SingleChildScrollView(
+                          controller: _hScrollController,
+                          scrollDirection: Axis.horizontal,
+                          child: SingleChildScrollView(
+                            controller: _vScrollController,
+                            child: ConstrainedBox(
+                              constraints: BoxConstraints(
+                                minWidth: constraints.maxWidth,
+                                minHeight: constraints.maxHeight,
+                              ),
+                              child: Center(
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    border: Border.all(
+                                      color: const Color(0xFFB8AF9A),
+                                    ),
+                                    boxShadow: const [
+                                      BoxShadow(
+                                        color: Colors.black26,
+                                        blurRadius: 8,
+                                        offset: Offset(0, 2),
+                                      ),
+                                    ],
+                                  ),
+                                  // The canvas widget is laid out at
+                                  // logical size * _effectiveZoom (fit-to-
+                                  // window baseline times the user's zoom
+                                  // multiplier) so it maximizes the
+                                  // available space by default and the
+                                  // scroll views can pan around it once
+                                  // zoomed in further; PathPainter applies
+                                  // the matching scale internally so
+                                  // background/path/bays stay in lockstep.
+                                  width: _canvasSize.width * _effectiveZoom,
+                                  height: _canvasSize.height * _effectiveZoom,
+                                  child: _buildCanvasCore(
+                                    floor,
+                                    zone,
+                                    _effectiveZoom,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                        );
+                      },
+                    ),
+                  )
+                // View mode: no zoom/pan state to manage, so scale the
+                // drawing up to fill as much of the available space as
+                // possible without distorting it, centered within
+                // whatever's left over. SizedBox.expand is required here,
+                // not Center -- Center hands FittedBox loose constraints,
+                // so it would just size to its child's native 1100x720
+                // and never actually grow to fill the viewport.
+                : SizedBox.expand(
+                    child: FittedBox(
+                      fit: BoxFit.contain,
+                      child: SizedBox(
+                        width: _canvasSize.width,
+                        height: _canvasSize.height,
+                        child: _buildCanvasCore(floor, zone, 1.0),
+                      ),
+                    ),
+                  ),
           ),
+          // Hidden entirely in View mode -- it's edit-scoped bookkeeping
+          // (waypoint/bay counts, sensor-pegging progress) that has
+          // nothing to show once editing is off.
+          if (_isEditMode)
+            _StatusBar(
+              floorName: floor.name,
+              zone: zone,
+              zoneCount: floor.zones.length,
+            ),
         ],
       ),
     );
@@ -687,15 +934,13 @@ class _InstructionsBar extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    final String actionText;
-    if (readOnly) {
-      actionText =
-          'Showing all zones — read-only. Select a zone above to edit its route and pegs.';
-    } else {
-      actionText = mode == CanvasMode.route
-          ? 'Route mode — click empty space to add a waypoint. Drag an existing waypoint to move it. Right-click a waypoint to remove it (right-click empty space undoes the last one).'
-          : 'Peg mode — click near the path to drop a bay. Drag a bay to move it. Double-click a bay to flag/unflag it as the end sensor. Right-click a bay to remove it.';
-    }
+    // Only ever rendered while in Edit mode -- View mode hides this bar
+    // entirely (see build()), so there's no "not editing" case to handle.
+    final actionText = readOnly
+        ? 'Showing all zones — read-only. Select a zone above to edit its route and pegs.'
+        : mode == CanvasMode.route
+        ? 'Route mode — click empty space to add a waypoint. Drag an existing waypoint to move it. Right-click a waypoint to remove it (right-click empty space undoes the last one).'
+        : 'Peg mode — click near the path to drop a bay. Drag a bay to move it. Double-click a bay to flag/unflag it as the end sensor. Right-click a bay to remove it.';
     final text =
         '$actionText Ctrl/Cmd+scroll to zoom toward the cursor. Hold Space and drag to pan.';
     return Container(
@@ -736,6 +981,8 @@ class _InstructionsBar extends StatelessWidget {
   }
 }
 
+// Only ever rendered while in Edit mode -- View mode hides this bar
+// entirely (see build()), so there's no "not editing" case to handle here.
 class _StatusBar extends StatelessWidget {
   final String floorName;
   final ZoneData? zone;

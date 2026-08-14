@@ -20,6 +20,7 @@ class ParkingLayoutApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Parking Layout — Canvas Test',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(seedColor: const Color(0xFF3E5C76)),
         useMaterial3: true,
